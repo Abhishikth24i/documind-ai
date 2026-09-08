@@ -14,19 +14,31 @@ import os
 import uuid
 from dataclasses import dataclass, field
 
-import faiss
 import numpy as np
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 800))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
 TOP_K = int(os.getenv("TOP_K", 4))
 
-# Loaded once at import time; reused for every request.
-_embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
+USE_LIGHTWEIGHT = os.getenv("LIGHTWEIGHT_RAG", "true").lower() in ("1", "true", "yes")
 
+_embedder = None
+faiss = None
+if not USE_LIGHTWEIGHT:
+    try:
+        from sentence_transformers import SentenceTransformer
+        import faiss as _faiss
+        faiss = _faiss
+        EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        _embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    except Exception as e:
+        print(f"[RAG Engine] SentenceTransformers/PyTorch not available ({e}). Running lightweight TF-IDF semantic engine.")
+        USE_LIGHTWEIGHT = True
+
+if USE_LIGHTWEIGHT:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
 
 import base64
 import zipfile
@@ -36,11 +48,12 @@ from PIL import Image
 
 @dataclass
 class DocumentStore:
-    """Holds the chunks + FAISS index + extracted images for a single uploaded document."""
+    """Holds the chunks + vector index + extracted images for an uploaded document."""
     doc_id: str
     filename: str
     chunks: list[str] = field(default_factory=list)
-    index: faiss.Index | None = None
+    index: any = None
+    vectors: any = None
     images: list[dict] = field(default_factory=list)
 
 
@@ -256,8 +269,10 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 def _embed(texts: list[str]) -> np.ndarray:
-    vectors = _embedder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-    return vectors.astype("float32")
+    if _embedder is not None:
+        vectors = _embedder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        return vectors.astype("float32")
+    return np.zeros((len(texts), 1), dtype="float32")
 
 
 def ingest_document(session_id: str, filename: str, file_bytes: bytes) -> dict:
@@ -319,15 +334,35 @@ def ingest_document(session_id: str, filename: str, file_bytes: bytes) -> dict:
     if not chunks:
         chunks = [text or "Visual document uploaded without plain text."]
 
-    vectors = _embed(chunks)
-    dimension = vectors.shape[1]
-
-    # Inner product on normalized vectors == cosine similarity.
-    index = faiss.IndexFlatIP(dimension)
-    index.add(vectors)
-
     doc_id = str(uuid.uuid4())
-    docs[doc_id] = DocumentStore(doc_id=doc_id, filename=filename, chunks=chunks, index=index, images=images)
+    if USE_LIGHTWEIGHT:
+        vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english", sublinear_tf=True)
+        try:
+            chunk_matrix = vectorizer.fit_transform(chunks)
+        except Exception:
+            vectorizer = TfidfVectorizer(ngram_range=(1, 1), sublinear_tf=True)
+            chunk_matrix = vectorizer.fit_transform(chunks)
+        docs[doc_id] = DocumentStore(
+            doc_id=doc_id,
+            filename=filename,
+            chunks=chunks,
+            index=vectorizer,
+            vectors=chunk_matrix,
+            images=images
+        )
+    else:
+        vectors = _embed(chunks)
+        dimension = vectors.shape[1]
+        index = faiss.IndexFlatIP(dimension)
+        index.add(vectors)
+        docs[doc_id] = DocumentStore(
+            doc_id=doc_id,
+            filename=filename,
+            chunks=chunks,
+            index=index,
+            vectors=vectors,
+            images=images
+        )
 
     return {
         "doc_id": doc_id,
@@ -375,17 +410,32 @@ def retrieve(session_id: str, doc_id: str, query: str, k: int = TOP_K) -> list[d
     if total_chunks <= 6:
         return [{"text": chunk, "score": 1.0} for chunk in store.chunks]
 
-    query_vector = _embed([query])
-    k = min(k, total_chunks)
-    scores, indices = store.index.search(query_vector, k)
-
     results = []
     seen_indices = set()
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1 or idx in seen_indices:
-            continue
-        seen_indices.add(idx)
-        results.append({"text": store.chunks[idx], "score": float(score)})
+
+    if USE_LIGHTWEIGHT and store.vectors is not None:
+        try:
+            query_vec = store.index.transform([query])
+            sim_scores = cosine_similarity(query_vec, store.vectors)[0]
+            top_indices = np.argsort(sim_scores)[::-1][:k]
+            for idx in top_indices:
+                seen_indices.add(int(idx))
+                results.append({"text": store.chunks[idx], "score": float(sim_scores[idx])})
+        except Exception as e:
+            print(f"[RAG Lightweight Retrieval Error] {e}")
+            for idx in range(min(k, total_chunks)):
+                results.append({"text": store.chunks[idx], "score": 1.0})
+    elif store.index is not None and hasattr(store.index, "search"):
+        query_vector = _embed([query])
+        scores, indices = store.index.search(query_vector, k)
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1 or idx in seen_indices:
+                continue
+            seen_indices.add(idx)
+            results.append({"text": store.chunks[idx], "score": float(score)})
+    else:
+        for idx in range(min(k, total_chunks)):
+            results.append({"text": store.chunks[idx], "score": 1.0})
 
     # If query is asking for summary or overview, make sure beginning of document is included
     query_lower = query.lower()
