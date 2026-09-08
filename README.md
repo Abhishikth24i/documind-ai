@@ -1,6 +1,6 @@
-# DocuMind AI
+# DocuMind AI — Multimodal Document Studio & RAG Assistant
 
-A RAG (Retrieval-Augmented Generation) document Q&A assistant. Upload a PDF or
+A multimodal RAG (Retrieval-Augmented Generation) document intelligence studio. Upload a PDF or
 text file, and ask natural-language questions grounded in its content.
 
 - **Retrieval:** Sentence Transformers embeddings (`all-MiniLM-L6-v2`) + FAISS
