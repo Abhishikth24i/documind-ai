@@ -1,7 +1,8 @@
 # DocuMind AI — Multimodal Document Studio & RAG Assistant
 
-A multimodal RAG (Retrieval-Augmented Generation) document intelligence studio. Upload a PDF or
-text file, and ask natural-language questions grounded in its content.
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Abhishikth24i/documind-ai)
+
+A multimodal RAG (Retrieval-Augmented Generation) document intelligence studio. Upload PDFs, documents, or images, extract diagrams, and ask natural-language questions grounded in your content.
 
 - **Retrieval:** Sentence Transformers embeddings (`all-MiniLM-L6-v2`) + FAISS
   for semantic search over document chunks. Always free, always runs on the
